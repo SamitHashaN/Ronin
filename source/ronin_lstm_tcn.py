@@ -12,11 +12,20 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 
+from sklearn.base import BaseEstimator,RegressorMixin
+
 from model_temporal import LSTMSeqNetwork, BilinearLSTMSeqNetwork, TCNSeqNetwork
 from utils import load_config, MSEAverageMeter
 from data_glob_speed import GlobSpeedSequence, SequenceToSequenceDataset
 from transformations import ComposeTransform, RandomHoriRotateSeq
 from metric import compute_absolute_trajectory_error, compute_relative_trajectory_error
+
+
+
+# python ronin_lstm_tcn.py train --train_list ~/Msc/code_ws/Ronnin_curent_dev/lists/list_train.txt --data_dir ~/Msc/Dataset/trainset --out_dir ~/Msc/code_ws/Ronnin_current_dev/output_samplef_1
+
+
+# python ronin_lstm_tcn.py test --test_list ~/Msc/code_ws/Ronnin_curent_dev/lists/list_test_seen.txt --data_dir ~/Msc/Dataset/trainset --out_dir ~/Msc/code_ws/Trained_models/output_samplef_1
 
 '''
 Temporal models with loss functions in global coordinate frame
@@ -29,7 +38,21 @@ Configurations
 torch.multiprocessing.set_sharing_strategy('file_system')
 _nano_to_sec = 1e09
 _input_channel, _output_channel = 6, 2
-device = 'cpu'
+device = 'cuda:0'
+
+
+
+
+class hyperParam_tune(BaseEstimator,RegressorMixin):
+
+    def __init__(self):
+        pass
+
+    def fit(self, X, y):
+        return self
+
+    def predict(self, T):
+        return Siren_test(args, kwargs)
 
 
 class GlobalPosLoss(torch.nn.Module):
@@ -51,8 +74,10 @@ class GlobalPosLoss(torch.nn.Module):
             self.history = 1
 
     def forward(self, pred, targ):
-        gt_pos = torch.cumsum(targ[:, 1:, ], 1)
-        pred_pos = torch.cumsum(pred[:, 1:, ], 1)
+        # gt_pos = torch.cumsum(targ[:, 1:, ], 1)
+        # pred_pos = torch.cumsum(pred[:, 1:, ], 1)
+        gt_pos = targ
+        pred_pos =pred
         if self.mode == 'part':
             gt_pos = gt_pos[:, self.history:, :] - gt_pos[:, :-self.history, :]
             pred_pos = pred_pos[:, self.history:, :] - pred_pos[:, :-self.history, :]
@@ -73,7 +98,7 @@ def write_config(args, **kwargs):
 def get_dataset(root_dir, data_list, args, **kwargs):
     input_format, output_format = [0, 3, 6], [0, _output_channel]
     mode = kwargs.get('mode', 'train')
-
+  
     random_shift, shuffle, transforms, grv_only = 0, False, [], False
 
     if mode == 'train':
@@ -93,8 +118,13 @@ def get_dataset(root_dir, data_list, args, **kwargs):
         from data_ridi import RIDIGlobSpeedSequence
         seq_type = RIDIGlobSpeedSequence
     dataset = SequenceToSequenceDataset(seq_type, root_dir, data_list, args.cache_path, args.step_size, args.window_size,
+                                        args.siren_omega0,args.siren_samplef, args.siren_steps,
                                         random_shift=random_shift, transform=transforms, shuffle=shuffle,
-                                        grv_only=grv_only, **kwargs)
+                                        grv_only=grv_only,**kwargs)
+   
+    # dataset = SequenceToSequenceDataset(seq_type, root_dir, data_list, args.cache_path, args.step_size, args.window_size,
+    #                                     random_shift=random_shift, transform=transforms, shuffle=shuffle,
+    #                                     grv_only=grv_only,**kwargs)
 
     return dataset
 
@@ -151,6 +181,13 @@ def format_string(*argv, sep=' '):
 
 
 def train(args, **kwargs):
+    
+    #siren parameters
+    args.siren_samplef=1                #testing with no sampling
+    args.siren_omega0 = 300 
+    args.siren_steps=500
+    
+    
     # Loading data
     start_t = time.time()
     train_dataset = get_dataset_from_list(args.data_dir, args.train_list, args, mode='train', **kwargs)
@@ -333,6 +370,8 @@ def recon_traj_with_preds_global(dataset, preds, ind=None, seq_id=0, type='preds
 def test(args, **kwargs):
     global device, _output_channel
     import matplotlib.pyplot as plt
+    
+    #siren params
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
@@ -463,6 +502,168 @@ def test(args, **kwargs):
             f.write(measure + '\n')
             f.write(values)
 
+def Siren_test(args, **kwargs):
+    global device, _output_channel
+    import matplotlib.pyplot as plt
+
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    if args.test_path is not None:
+        print('step1')
+        if args.test_path[-1] == '/':
+            print('step2')
+            args.test_path = args.test_path[:-1]
+        root_dir = osp.split(args.test_path)[0]
+        test_data_list = [osp.split(args.test_path)[1]]
+        print('step3')
+    elif args.test_list is not None:
+        print('step1')
+        root_dir = args.data_dir if args.data_dir else osp.split(args.test_list)[0]
+        with open(args.test_list) as f:
+            test_data_list = [s.strip().split(',')[0] for s in f.readlines() if len(s) > 0 and s[0] != '#']
+    else:
+        raise ValueError('Either test_path or test_list must be specified.')
+
+    # Load the first sequence to update the input and output size
+    _ = get_dataset(root_dir, [test_data_list[0]], args, mode='test')
+
+    if args.out_dir_sub and not osp.exists(args.out_dir_sub):
+        os.makedirs(args.out_dir_sub)
+        
+    log_file = None
+    if args.test_list and args.out_dir_sub:
+        log_file = osp.join(args.out_dir_sub, osp.split(args.test_list)[-1].split('.')[0] + '_log.txt')
+        with open(log_file, 'w') as f:
+            f.write("SirenModel- sample_f =100 , steps =500, omega_0 = 300"+ '\n')
+            f.write('Seq traj_len velocity ate rte\n')
+
+    losses_vel = MSEAverageMeter(2, [1], _output_channel)
+    ate_all, rte_all = [], []
+    pred_per_min = 200 * 60
+
+    seq_dataset = get_dataset(root_dir, test_data_list, args, mode='test', **kwargs)
+
+    for idx, data in enumerate(test_data_list):
+        assert data == osp.split(seq_dataset.data_path[idx])[1]
+
+        #ground truth  - vel
+        #prediction by siren - preds
+        vel, preds = seq_dataset.get_test_seq_SIREN(idx)
+        print(vel.shape[1],preds.shape[1])
+        ind = np.arange(vel.shape[0])
+        vel_losses = np.mean((vel - preds) ** 2, axis=0)
+        losses_vel.add(vel, preds)
+
+        print('Reconstructing trajectory')
+        pos_pred, gv_pred, _ = recon_traj_with_preds_global(seq_dataset, preds, ind=ind, type='pred', seq_id=idx)
+        pos_gt, gv_gt, _ = recon_traj_with_preds_global(seq_dataset, vel, ind=ind, type='gt', seq_id=idx)
+
+        if args.out_dir_sub is not None and osp.isdir(args.out_dir_sub):
+            np.save(osp.join(args.out_dir_sub, '{}_{}.npy'.format(data, args.type)),
+                    np.concatenate([pos_pred, pos_gt], axis=1))
+
+        ate = compute_absolute_trajectory_error(pos_pred, pos_gt)
+        if pos_pred.shape[0] < pred_per_min:
+            ratio = pred_per_min / pos_pred.shape[0]
+            rte = compute_relative_trajectory_error(pos_pred, pos_gt, delta=pos_pred.shape[0] - 1) * ratio
+        else:
+            rte = compute_relative_trajectory_error(pos_pred, pos_gt, delta=pred_per_min)
+        pos_cum_error = np.linalg.norm(pos_pred - pos_gt, axis=1)
+        ate_all.append(ate)
+        rte_all.append(rte)
+
+        print('Sequence {}, Velocity loss {} / {}, ATE: {}, RTE:{}'.format(data, vel_losses, np.mean(vel_losses), ate,
+                                                                           rte))
+        log_line = format_string(data, np.mean(vel_losses), ate, rte)
+
+        if not args.fast_test:
+            kp = preds.shape[1]
+            if kp == 2:
+                targ_names = ['vx', 'vy']
+            elif kp == 3:
+                targ_names = ['vx', 'vy', 'vz']
+
+            plt.figure('{}'.format(data), figsize=(16, 9))
+            plt.subplot2grid((kp, 2), (0, 0), rowspan=kp - 1)
+            plt.plot(pos_pred[:, 0], pos_pred[:, 1])
+            plt.plot(pos_gt[:, 0], pos_gt[:, 1])
+            plt.title(data + 'SirenModel- sample_f =100 , steps =500, omega_0 = 300')
+            plt.axis('equal')
+            plt.legend(['Predicted', 'Ground truth'])
+            plt.subplot2grid((kp, 2), (kp - 1, 0))
+            plt.plot(pos_cum_error)
+            plt.legend(['ATE:{:.3f}, RTE:{:.3f}'.format(ate_all[-1], rte_all[-1])])
+            
+            for i in range(kp):
+                plt.subplot2grid((kp, 2), (i, 1))
+                plt.plot(ind, preds[:, i])
+                plt.plot(ind, vel[:, i])
+                plt.legend(['Predicted', 'Ground truth'])
+                plt.title('{}, error: {:.6f}'.format(targ_names[i], vel_losses[i]))
+            plt.tight_layout()
+
+            if args.show_plot:
+                plt.show()
+
+            if args.out_dir_sub is not None and osp.isdir(args.out_dir_sub):
+                plt.savefig(osp.join(args.out_dir_sub, '{}_{}.png'.format(data, args.type)))
+
+        if log_file is not None:
+            with open(log_file, 'a') as f:
+                log_line += '\n'
+                f.write(log_line)
+
+        plt.close('all')
+
+    ate_all = np.array(ate_all)
+    rte_all = np.array(rte_all)
+
+    measure = format_string('ATE', 'RTE', sep='\t')
+    values = format_string(np.mean(ate_all), np.mean(rte_all), sep='\t')
+    print(measure, '\n', values)
+
+    if log_file is not None:
+        with open(log_file, 'a') as f:
+            f.write(measure + '\n')
+            f.write(values)
+    
+    return ate_all,rte_all,values
+
+def siren_Eval(sample_f,Omega_0,steps,args):
+    
+
+    for sampleF in sample_f:
+        args.siren_samplef=sampleF
+        if args.out_dir and not osp.exists(args.out_dir):
+            os.makedirs(args.out_dir)
+            
+        folder_name= 'sample_{}'.format(sampleF)
+        folder_path_F = os.path.join(args.out_dir, folder_name)
+        if folder_path_F and not osp.exists(folder_path_F):
+            os.makedirs(folder_path_F)
+            
+        for omega in Omega_0:
+            args.siren_omega0 = omega
+            if args.out_dir and not osp.exists(args.out_dir):
+                os.makedirs(args.out_dir)
+            
+            folder_name= '{}omega_0'.format(omega)
+            folder_path_o = os.path.join(folder_path_F, folder_name)
+            if folder_path_o and not osp.exists(folder_path_o):
+                os.makedirs(folder_path_o)
+ 
+            for step_i in steps:
+                args.siren_steps=step_i
+                
+                folder_name= '{}steps'.format(step_i)
+                folder_path_s = os.path.join(folder_path_o, folder_name)
+                args.out_dir_sub = folder_path_s
+                if folder_path_s and not osp.exists(folder_path_s):
+                    os.makedirs(folder_path_s)
+                print(args.siren_omega0,args.siren_samplef, args.siren_steps,folder_path_s)
+                Siren_test(args, **kwargs)
+                
+
 
 if __name__ == '__main__':
     """
@@ -489,8 +690,11 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int)
     parser.add_argument('--num_workers', type=int)
     parser.add_argument('--out_dir', type=str, default=None)
+    parser.add_argument('--out_dir_sub', type=str, default=None)
     parser.add_argument('--device', type=str, help='Cuda device (e.g:- cuda:0) or cpu')
     parser.add_argument('--dataset', type=str, choices=['ronin', 'ridi'])
+
+    
     # tcn
     tcn_cmd = parser.add_argument_group('tcn', 'configuration for TCN')
     tcn_cmd.add_argument('--kernel_size', type=int)
@@ -510,6 +714,9 @@ if __name__ == '__main__':
     train_cmd.add_argument('--epochs', type=int)
     train_cmd.add_argument('--save_interval', type=int)
     train_cmd.add_argument('--lr', '--learning_rate', type=float)
+    train_cmd.add_argument('--siren_omega0',type=int)
+    train_cmd.add_argument('--siren_samplef',type=int)
+    train_cmd.add_argument('--siren_steps',type=int)
     # test
     test_cmd = mode.add_parser('test')
     test_cmd.add_argument('--test_path', type=str, default=None)
@@ -517,6 +724,7 @@ if __name__ == '__main__':
     test_cmd.add_argument('--model_path', type=str, default=None)
     test_cmd.add_argument('--fast_test', action='store_true')
     test_cmd.add_argument('--show_plot', action='store_true')
+
 
     '''
     Extra arguments
@@ -532,6 +740,10 @@ if __name__ == '__main__':
     np.set_printoptions(formatter={'all': lambda x: '{:.6f}'.format(x)})
 
     args, kwargs = load_config(default_config_file, args, unknown_args)
+    
+    # --data_dir 'C:/Samith/SIRENproject/Ronin/ronin_dataset/RONIN'
+    # --train_list 'lists/list_train.txt'
+    # --out_dir 'C:/Samith/SIRENproject/Ronin/output'
 
     print(args, kwargs)
     if args.mode == 'train':
@@ -540,4 +752,5 @@ if __name__ == '__main__':
         if not args.model_path:
             raise ValueError("Model path required")
         args.batch_size = 1
+        #siren_Eval([4,5],[30,60,100,200,300],[500,1000,2000,3000,4000],args)
         test(args, **kwargs)

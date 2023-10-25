@@ -7,7 +7,7 @@ import numpy as np
 import quaternion
 from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import Dataset
-
+from siren_func import genrate_gtpose,train_Siren
 from data_utils import CompiledSequence, select_orientation_source, load_cached_sequences
 
 
@@ -22,7 +22,7 @@ class GlobSpeedSequence(CompiledSequence):
 
     def __init__(self, data_path=None, **kwargs):
         super().__init__(**kwargs)
-        self.ts, self.features, self.targets, self.orientations, self.gt_pos = None, None, None, None, None
+        self.ts, self.features, self.targets,self.orientations, self.gt_pos = None,None, None, None, None
         self.info = {}
 
         self.grv_only = kwargs.get('grv_only', False)
@@ -59,7 +59,12 @@ class GlobSpeedSequence(CompiledSequence):
 
         dt = (ts[self.w:] - ts[:-self.w])[:, None]
         glob_v = (tango_pos[self.w:] - tango_pos[:-self.w]) / dt
-
+        print('Trajectory Lenght :', len(glob_v))
+        
+        #Train the siren with gt pos- train_Siren(data_sequence,train_steps,sample_freq)
+        #special note - Siren was not able to learn the psositions properly.
+        #tango_pos = train_Siren(tango_pos,1000,1)
+        
         gyro_q = quaternion.from_float_array(np.concatenate([np.zeros([gyro.shape[0], 1]), gyro], axis=1))
         acce_q = quaternion.from_float_array(np.concatenate([np.zeros([acce.shape[0], 1]), acce], axis=1))
         glob_gyro = quaternion.as_float_array(ori_q * gyro_q * ori_q.conj())[:, 1:]
@@ -69,6 +74,8 @@ class GlobSpeedSequence(CompiledSequence):
         self.ts = ts[start_frame:]
         self.features = np.concatenate([glob_gyro, glob_acce], axis=1)[start_frame:]
         self.targets = glob_v[start_frame:, :2]
+
+        # print('shape of array :', self.features.shape) 
         self.orientations = quaternion.as_float_array(ori_q)[start_frame:]
         self.gt_pos = tango_pos[start_frame:]
 
@@ -187,7 +194,10 @@ class StridedSequenceDataset(Dataset):
 
 class SequenceToSequenceDataset(Dataset):
     def __init__(self, seq_type, root_dir, data_list, cache_path=None, step_size=100, window_size=400,
-                 random_shift=0, transform=None, **kwargs):
+                  siren_omega=300,siren_sampleF=4,siren_steps=500,
+                  random_shift=0, transform=None,**kwargs):
+    # def __init__(self, seq_type, root_dir, data_list, cache_path=None, step_size=100, window_size=400,
+    #              random_shift=0, transform=None,**kwargs):
         super(SequenceToSequenceDataset, self).__init__()
         self.seq_type = seq_type
         self.feature_dim = seq_type.feature_dim
@@ -200,8 +210,11 @@ class SequenceToSequenceDataset(Dataset):
 
         self.data_path = [osp.join(root_dir, data) for data in data_list]
         self.index_map = []
-
-        self.features, self.targets, aux = load_cached_sequences(
+        
+        self.siren_omega=siren_omega
+        self.siren_sampleF=siren_sampleF
+        self.siren_steps=siren_steps
+        self.features, self.targets, self.targets_gt, aux = load_cached_sequences(
             seq_type, root_dir, data_list, cache_path, **kwargs)
 
         # Optionally smooth the sequence
@@ -215,12 +228,22 @@ class SequenceToSequenceDataset(Dataset):
         max_norm = kwargs.get('max_velocity_norm', 3.0)
         self.ts, self.orientations, self.gt_pos, self.local_v = [], [], [], []
         for i in range(len(data_list)):
+            
             self.features[i] = self.features[i][:-1]
             self.targets[i] = self.targets[i]
+            
+            
+            
+            #Train the siren with gt pos- train_Siren(data_sequence,train_steps,sample_freq)
+            #using velocity values with siren was successfull. 
+            #print(len(self.targets[i]))
+            self.targets[i]=train_Siren(self.targets[i],self.siren_steps, self.siren_sampleF, self.siren_omega)
+    
+            
             self.ts.append(aux[i][:-1, :1])
             self.orientations.append(aux[i][:-1, 1:5])
             self.gt_pos.append(aux[i][:-1, 5:8])
-
+            #Add siren here
             velocity = np.linalg.norm(self.targets[i], axis=1)  # Remove outlier ground truth data
             bad_data = velocity > max_norm
             for j in range(window_size + random_shift, self.targets[i].shape[0], step_size):
@@ -231,15 +254,17 @@ class SequenceToSequenceDataset(Dataset):
             random.shuffle(self.index_map)
 
     def __getitem__(self, item):
+        
         # output format: input, target, seq_id, frame_id
         seq_id, frame_id = self.index_map[item][0], self.index_map[item][1]
         if self.random_shift > 0:
             frame_id += random.randrange(-self.random_shift, self.random_shift)
             frame_id = max(self.window_size, min(frame_id, self.targets[seq_id].shape[0] - 1))
-
+            
         feat = np.copy(self.features[seq_id][frame_id - self.window_size:frame_id])
         targ = np.copy(self.targets[seq_id][frame_id - self.window_size:frame_id])
-
+       
+        #Add siren here
         if self.transform is not None:
             feat, targ = self.transform(feat, targ)
 
@@ -250,3 +275,6 @@ class SequenceToSequenceDataset(Dataset):
 
     def get_test_seq(self, i):
         return self.features[i].astype(np.float32)[np.newaxis,], self.targets[i].astype(np.float32)
+    
+    def get_test_seq_SIREN(self, i):
+        return self.targets_gt[i].astype(np.float32), self.targets[i].astype(np.float32)

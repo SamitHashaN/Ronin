@@ -100,7 +100,7 @@ def load_cached_sequences(seq_type, root_dir, data_list, cache_path, **kwargs):
         features_all.append(feat)
         targets_all.append(targ)
         aux_all.append(aux)
-    return features_all, targets_all, aux_all
+    return features_all, targets_all, targets_all, aux_all #added extra target to be used with SIREN testing
 
 
 def select_orientation_source(data_path, max_ori_error=20.0, grv_only=True, use_ekf=True):
